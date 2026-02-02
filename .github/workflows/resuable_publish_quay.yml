@@ -1,0 +1,159 @@
+# Reusable Promote Image Workflow
+# Promotes images between registries with signature verification and attestation preservation.
+
+name: Reusable Promote Image
+
+on:
+  workflow_call:
+    inputs:
+      source_registry:
+        description: 'Source registry (e.g., ghcr.io)'
+        required: true
+        type: string
+      source_image:
+        description: 'Source image (e.g., org/image-name)'
+        required: true
+        type: string
+      source_tag:
+        description: 'Source tag (e.g., sha-abc123)'
+        required: true
+        type: string
+      dest_registry:
+        description: 'Destination registry (e.g., quay.io)'
+        required: true
+        type: string
+      dest_image:
+        description: 'Destination image (e.g., org/image-name)'
+        required: true
+        type: string
+      dest_tag:
+        description: 'Primary destination tag (e.g., v1.2.3)'
+        required: true
+        type: string
+      additional_tags:
+        description: 'Comma-separated additional tags'
+        required: false
+        type: string
+      include_sha_tags:
+        description: 'Auto-add SHA tags (long + short) for immutability'
+        type: boolean
+        default: true
+      verify_signature:
+        description: 'Verify signatures before and after promotion'
+        type: boolean
+        default: true
+      allowed_identity_regex:
+        description: 'Cosign certificate identity regex'
+        required: false
+        type: string
+      fail_if_dest_exists:
+        description: 'Fail if destination tag exists (immutability)'
+        type: boolean
+        default: true
+    secrets:
+      source_token:
+        required: false
+      dest_username:
+        required: true
+      dest_password:
+        required: true
+    outputs:
+      digest:
+        description: 'Promoted image digest'
+        value: ${{ jobs.promote.outputs.digest }}
+      image:
+        description: 'Full destination image (registry/name)'
+        value: ${{ jobs.promote.outputs.image }}
+
+permissions:
+  contents: none
+  packages: none
+
+concurrency:
+  group: promote-${{ inputs.source_image }}-${{ inputs.dest_tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: read
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+      image: ${{ inputs.dest_registry }}/${{ inputs.dest_image }}
+    env:
+      SOURCE_REF: ${{ inputs.source_registry }}/${{ inputs.source_image }}
+      DEST_REF: ${{ inputs.dest_registry }}/${{ inputs.dest_image }}
+      IDENTITY: ${{ inputs.allowed_identity_regex || format('https://github.com/{0}/.*', github.repository_owner) }}
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Authenticate registries
+        env:
+          SRC_TOKEN: ${{ secrets.source_token || secrets.GITHUB_TOKEN }}
+          DEST_USER: ${{ secrets.dest_username }}
+          DEST_PASS: ${{ secrets.dest_password }}
+        run: |
+          echo "$SRC_TOKEN" | crane auth login ${{ inputs.source_registry }} -u ${{ github.actor }} --password-stdin
+          echo "$SRC_TOKEN" | cosign login ${{ inputs.source_registry }} -u ${{ github.actor }} --password-stdin
+          echo "$DEST_PASS" | crane auth login ${{ inputs.dest_registry }} -u "$DEST_USER" --password-stdin
+          echo "$DEST_PASS" | cosign login ${{ inputs.dest_registry }} -u "$DEST_USER" --password-stdin
+
+      - name: Resolve source digest
+        id: resolve
+        run: |
+          DIGEST=$(crane digest "${SOURCE_REF}:${{ inputs.source_tag }}") || {
+            echo "::error::Source not found: ${SOURCE_REF}:${{ inputs.source_tag }}"
+            exit 1
+          }
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Check destination availability
+        if: ${{ inputs.fail_if_dest_exists }}
+        run: |
+          if crane manifest "${DEST_REF}:${{ inputs.dest_tag }}" &>/dev/null; then
+            echo "::error::Tag exists: ${DEST_REF}:${{ inputs.dest_tag }}"
+            echo "Use fail_if_dest_exists: false to overwrite"
+            exit 1
+          fi
+
+      - name: Verify source signature
+        if: ${{ inputs.verify_signature }}
+        run: |
+          cosign verify "${SOURCE_REF}@${{ steps.resolve.outputs.digest }}" \
+            --certificate-identity-regexp="$IDENTITY" \
+            --certificate-oidc-issuer="$OIDC_ISSUER"
+
+      - name: Promote image
+        env:
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          cosign copy "${SOURCE_REF}@${DIGEST}" "${DEST_REF}:${{ inputs.dest_tag }}"
+
+          # SHA tags for immutability (long + short)
+          if [[ "${{ inputs.include_sha_tags }}" == "true" ]]; then
+            crane tag "${DEST_REF}@${DIGEST}" "${SOURCE_TAG}"
+            # Short SHA: first 7 chars after 'sha-' prefix
+            if [[ "$SOURCE_TAG" =~ ^sha-([a-f0-9]+)$ ]]; then
+              crane tag "${DEST_REF}@${DIGEST}" "sha-${BASH_REMATCH[1]:0:7}"
+            fi
+          fi
+
+          # Additional custom tags
+          if [[ -n "${{ inputs.additional_tags }}" ]]; then
+            IFS=',' read -ra TAGS <<< "${{ inputs.additional_tags }}"
+            for TAG in "${TAGS[@]}"; do
+              crane tag "${DEST_REF}@${DIGEST}" "${TAG// /}"
+            done
+          fi
+
+      - name: Verify destination signature
+        if: ${{ inputs.verify_signature }}
+        run: |
+          cosign verify "${DEST_REF}@${{ steps.resolve.outputs.digest }}" \
+            --certificate-identity-regexp="$IDENTITY" \
+            --certificate-oidc-issuer="$OIDC_ISSUER"
