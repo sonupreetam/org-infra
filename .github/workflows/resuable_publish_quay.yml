@@ -3,7 +3,7 @@
 
 name: Reusable Promote Image
 
-on:
+"on":
   workflow_call:
     inputs:
       source_registry:

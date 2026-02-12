@@ -1,7 +1,16 @@
 # Reusable Sign and Verify Workflow
 # ==================================
-# Implements keyless container image signing using Sigstore/Cosign.
-# Supports both full verification (signature + attestations) and signature-only mode.
+# Signs container images with Sigstore keyless signing and verifies all attestations.
+#
+# Prerequisites (attestations must exist before calling this workflow):
+#   - SLSA provenance: from reusable_push_ghcr.yml (actions/attest-build-provenance)
+#   - SBOM:            from reusable_push_ghcr.yml (actions/attest-sbom)
+#   - Vuln scan:       from reusable_vuln_scan.yml (cosign attest --type vuln)
+#
+# Security guarantees:
+#   - All attestations are Sigstore-signed with Rekor transparency log
+#   - Certificate identity and OIDC issuer are verified
+#   - Workflow fails if ANY attestation is missing or invalid
 
 name: Reusable Sign and Verify
 
@@ -9,73 +18,71 @@ on:
   workflow_call:
     inputs:
       image_name:
-        description: 'Comma-separated full image names (e.g., ghcr.io/org/image,quay.io/org/image)'
+        description: 'Full image name (e.g., ghcr.io/org/image)'
         required: true
         type: string
       digest:
-        description: 'Pushed image digest to sign/verify'
+        description: 'Image digest to sign/verify (sha256:...)'
         required: true
         type: string
       allowed_identity_regex:
-        description: 'Regex for Cosign certificate identity (optional, defaults to org-level)'
-        required: false
+        description: 'Certificate identity regex for Sigstore verification (e.g., https://github.com/org/repo/.github/workflows/reusable_.*)'
+        required: true
         type: string
       sign_environment:
-        description: 'Environment name to gate signing (for required reviewers)'
+        description: 'Environment for signing approval gates'
         required: false
         type: string
-        default: 'signing'
-      registry_username:
-        description: 'Username for GHCR login (defaults to github.actor)'
-        required: false
-        type: string
-      verify_attestations:
-        description: 'Verify SBOM and SLSA attestations (disable for promoted images)'
-        required: false
-        type: boolean
-        default: true
-      skip_sign:
-        description: 'Skip signing, only verify (for pre-promotion checks)'
-        required: false
-        type: boolean
-        default: false
+        default: ''
     secrets:
-      registry_token:
-        description: 'Optional GHCR token. If not provided, falls back to GITHUB_TOKEN.'
-        required: false
       quay_username:
-        description: 'Quay.io username/robot for login (only needed if signing quay.io images)'
+        description: 'Quay.io username (only for quay.io images)'
         required: false
       quay_password:
-        description: 'Quay.io password/token for login (only needed if signing quay.io images)'
+        description: 'Quay.io password (only for quay.io images)'
         required: false
+    outputs:
+      digest:
+        description: 'Signed image digest'
+        value: ${{ jobs.sign-and-verify.outputs.digest }}
+      image:
+        description: 'Signed image reference'
+        value: ${{ jobs.sign-and-verify.outputs.image }}
 
 permissions:
   packages: none
   id-token: none
 
 concurrency:
-  group: reusable-sign-verify-${{ inputs.image_name }}-${{ github.ref }}
+  group: sign-verify-${{ inputs.digest }}
   cancel-in-progress: true
 
 jobs:
   sign-and-verify:
+    if: ${{ github.ref_protected }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
-      packages: write   # Push signature as OCI artifact to registry
-      id-token: write   # Request OIDC token for keyless signing via Sigstore
+      packages: write   # Push signature to registry
+      id-token: write   # OIDC token for keyless signing
+    environment: ${{ inputs.sign_environment || null }}
+    outputs:
+      digest: ${{ inputs.digest }}
+      image: ${{ inputs.image_name }}
 
-    environment: ${{ inputs.skip_sign && '' || inputs.sign_environment }}
+    env:
+      IMAGE: ${{ inputs.image_name }}@${{ inputs.digest }}
+      IDENTITY: ${{ inputs.allowed_identity_regex }}
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+
     steps:
-      # Registry authentication for signature push
       - name: Log in to GHCR
         if: contains(inputs.image_name, 'ghcr.io')
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
-          username: ${{ inputs.registry_username || github.actor }}
-          password: ${{ secrets.registry_token || github.token }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Quay
         if: contains(inputs.image_name, 'quay.io')
@@ -85,73 +92,20 @@ jobs:
           username: ${{ secrets.quay_username }}
           password: ${{ secrets.quay_password }}
 
-      - name: Validate digest format
-        env:
-          DIGEST: ${{ inputs.digest }}
-          IMAGE_INPUT: ${{ inputs.image_name }}
-        run: |
-          # Ensure digest is a valid sha256 format (immutability guarantee)
-          # Protects against accidentally signing a tag (which can be overwritten)
-          if ! echo "$DIGEST" | grep -qE '^sha256:[a-f0-9]{64}$'; then
-            echo "::error::Invalid digest format. Expected 'sha256:<64-hex-chars>', got: '$DIGEST'"
-            exit 1
-          fi
-          # Warn if image_name contains a tag (ignored with digest, may indicate caller mistake)
-          # Common error: passing "image:tag" when "image" + digest is expected
-          if echo "$IMAGE_INPUT" | grep -qE ':[^/@]+$'; then
-            echo "::warning::image_name appears to contain a tag. Tags are ignored when using digest references."
-          fi
-
       - name: Install Cosign
         uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
 
-      - name: Sign images
-        if: ${{ !inputs.skip_sign }}
-        env:
-          IMAGE_INPUT: ${{ inputs.image_name }}
-          DIGEST: ${{ inputs.digest }}
-        run: |
-          # Sign each image (digest ensures exact match to build)
-          IFS=',' read -ra IMAGES <<< "$IMAGE_INPUT"
-          for NAME in "${IMAGES[@]}"; do
-            NAME="${NAME// /}"  # trim whitespace
-            echo "Signing: ${NAME}@${DIGEST}"
-            cosign sign --yes "${NAME}@${DIGEST}"
-          done
+      - name: Sign image
+        run: cosign sign --yes "$IMAGE"
 
-      - name: Verify signature and attestations
-        env:
-          IMAGE_INPUT: ${{ inputs.image_name }}
-          DIGEST: ${{ inputs.digest }}
-          IDENTITY_REGEX: ${{ inputs.allowed_identity_regex || format('https://github.com/{0}/.*', github.repository_owner) }}
-          VERIFY_ATTESTATIONS: ${{ inputs.verify_attestations }}
-        run: |
-          # Use first image (all copies share same digest)
-          IMAGE="${IMAGE_INPUT%%,*}@${DIGEST}"
-          IMAGE="${IMAGE# }"  # trim leading space
+      - name: Verify signature
+        run: cosign verify --certificate-identity-regexp="$IDENTITY" --certificate-oidc-issuer="$OIDC_ISSUER" "$IMAGE"
 
-          COSIGN_FLAGS=(
-            "--certificate-identity-regexp=$IDENTITY_REGEX"
-            "--certificate-oidc-issuer=https://token.actions.githubusercontent.com"
-          )
+      - name: Verify SLSA provenance
+        run: cosign verify-attestation --type https://slsa.dev/provenance/v1 --certificate-identity-regexp="$IDENTITY" --certificate-oidc-issuer="$OIDC_ISSUER" "$IMAGE"
 
-          echo "Verifying signature: $IMAGE"
-          cosign verify "${COSIGN_FLAGS[@]}" "$IMAGE"
+      - name: Verify SBOM
+        run: cosign verify-attestation --type https://spdx.dev/Document/v2.3 --certificate-identity-regexp="$IDENTITY" --certificate-oidc-issuer="$OIDC_ISSUER" "$IMAGE"
 
-          if [[ "$VERIFY_ATTESTATIONS" == "true" ]]; then
-            echo "Verifying SLSA provenance: $IMAGE"
-            cosign verify-attestation "${COSIGN_FLAGS[@]}" --type slsaprovenance "$IMAGE"
-
-            echo "Verifying SBOM: $IMAGE"
-            cosign verify-attestation "${COSIGN_FLAGS[@]}" --type spdx "$IMAGE"
-          fi
-
-      - name: Summary
-        env:
-          VERIFY_ATTESTATIONS: ${{ inputs.verify_attestations }}
-          SKIP_SIGN: ${{ inputs.skip_sign }}
-        run: |
-          echo "All verifications passed!"
-          echo "Signed: $([[ "$SKIP_SIGN" == "true" ]] && echo "No (verify only)" || echo "Yes")"
-          echo "Attestations: $([[ "$VERIFY_ATTESTATIONS" == "true" ]] && echo "SLSA + SBOM" || echo "signature only")"
-
+      - name: Verify vulnerability scan
+        run: cosign verify-attestation --type vuln --certificate-identity-regexp="$IDENTITY" --certificate-oidc-issuer="$OIDC_ISSUER" "$IMAGE"

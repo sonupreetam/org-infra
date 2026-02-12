@@ -13,6 +13,7 @@ permissions:
   actions: none
   id-token: none
   security-events: none
+  packages: none
 
 jobs:
   call_reusable_vuln_scan:
@@ -21,6 +22,8 @@ jobs:
       contents: read
       actions: read
       security-events: write
+      packages: write
+      id-token: write
     uses: complytime/org-infra/.github/workflows/reusable_vuln_scan.yml@main
     # TODO: Re-add 'enable_trivy_source: true' once reusable_vuln_scan.yml is merged to main
     # with:
