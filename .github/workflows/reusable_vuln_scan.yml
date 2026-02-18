@@ -59,7 +59,7 @@ jobs:
     name: OSV-Scanner
     if: ${{ inputs.enable_osv }}
     # https://google.github.io/osv-scanner/github-action/
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@2a387edfbe02a11d856b89172f6e978100177eb4 # v2.3.2
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@c5996e0193a3df57d695c1b8a1dec2a4c62e8730 # v2.3.3
     permissions:
       contents: read
       actions: read
@@ -85,7 +85,7 @@ jobs:
 
       - name: Run Trivy source scanner
         id: trivy
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
         with:
           scan-type: 'fs'
           scanners: 'secret,misconfig'
@@ -99,7 +99,7 @@ jobs:
 
       - name: Upload SARIF
         if: ${{ always() }}
-        uses: github/codeql-action/upload-sarif@45cbd0c69e560cd9e7cd7f8c32362050c9b7ded2 # v4.32.2
+        uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
         with:
           sarif_file: 'trivy-source-scan-${{ github.workflow_sha }}-${{ github.run_number }}.sarif'
           category: 'trivy-source'
@@ -135,7 +135,7 @@ jobs:
 
       - name: Run Trivy image scanner
         id: trivy
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
         with:
           scan-type: 'image'
           scanners: 'vuln'
@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload SARIF
         if: ${{ always() }}
-        uses: github/codeql-action/upload-sarif@45cbd0c69e560cd9e7cd7f8c32362050c9b7ded2 # v4.32.2
+        uses: github/codeql-action/upload-sarif@9e907b5e64f6b83e7804b09294d44122997950d6 # v4.32.3
         with:
           sarif_file: 'trivy-image-scan-${{ github.workflow_sha }}-${{ github.run_number }}.sarif'
           category: 'trivy-image'

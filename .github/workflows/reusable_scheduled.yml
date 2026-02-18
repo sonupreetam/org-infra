@@ -24,7 +24,7 @@ jobs:
   call_ext_osv_scanner:
     name: OSV-Scanner
     # https://google.github.io/osv-scanner/github-action/
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@2a387edfbe02a11d856b89172f6e978100177eb4 # v2.3.2
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@c5996e0193a3df57d695c1b8a1dec2a4c62e8730 # v2.3.3
     permissions:
       contents: read
       actions: read           # Needed to upload SARIF file to CodeQL. See: https://github.com/github/codeql-action/issues/2117
