@@ -1,0 +1,14 @@
+name: Test If Condition
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  call_dependabot_reviewer:
+    name: Dependabot Review (uses !=)
+    uses: ./.github/workflows/reusable_dependabot_reviewer.yml
