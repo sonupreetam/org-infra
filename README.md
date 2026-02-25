@@ -73,3 +73,4 @@ org-infra/
 * Write permissions must be avoided. When necessary, they are defined in the minimal possible scope.
 * Prefer defining explicit permissions per Job.
 * PRs must pass all CI jobs.
+
