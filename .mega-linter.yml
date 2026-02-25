@@ -13,5 +13,7 @@ ENABLE_LINTERS:
   - PROTOBUF_PROTOLINT
   - REPOSITORY_GITLEAKS
   - REPOSITORY_KICS
+  - SPELL_LYCHEE
   - YAML_YAMLLINT
 REPOSITORY_KICS_ARGUMENTS: "--fail-on high"
+SPELL_LYCHEE_ARGUMENTS: "--exclude-loopback --exclude-all-private --exclude example\\.com --exclude example\\.org"
