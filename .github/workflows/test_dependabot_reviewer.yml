@@ -1,0 +1,305 @@
+name: Test Dependabot Reviewer
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to test (owner/repo)"
+        required: true
+        default: "complytime/org-infra"
+      commit_sha:
+        description: "Dependabot commit SHA to test"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test_dependabot_review:
+    name: Test Dependabot Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: "${{ inputs.repo }}"
+          ref: "${{ inputs.commit_sha }}"
+          fetch-depth: 2
+
+      - name: Get Dependency Information
+        id: dep_info
+        shell: bash
+        env:
+          DEPENDABOT_SHA: "${{ inputs.commit_sha }}"
+        run: |
+          set -e
+          REF="${DEPENDABOT_SHA:-HEAD}"
+          DIFF="$(git diff "$REF^..$REF" 2>/dev/null || git diff HEAD^..HEAD 2>/dev/null)"
+          COMMIT_SUBJECT="$(git log -1 --format=%s "$REF" 2>/dev/null || echo "")"
+          COMMIT_BODY="$(git log -1 --format=%B "$REF" 2>/dev/null || echo "")"
+          echo "Dependabot Commit Subject: $COMMIT_SUBJECT"
+          echo "Diff length: ${#DIFF} bytes"
+
+          dep_name=""
+          from_version=""
+          to_version=""
+          uses_query=""
+          extracted_from_diff=false
+
+          # ---- Actions: extract exact "uses: name@ref" from diff ----
+          if [[ -n "$DIFF" ]]; then
+            rm -f /tmp/uses_old.txt /tmp/uses_new.txt
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^-[[:space:]]*uses:[[:space:]]*([^@[:space:]]+)@([^[:space:]#]+) ]]; then
+                echo "${BASH_REMATCH[1]}@${BASH_REMATCH[2]}" >> /tmp/uses_old.txt
+              fi
+              if [[ "$line" =~ ^\+[[:space:]]*uses:[[:space:]]*([^@[:space:]]+)@([^[:space:]#]+) ]]; then
+                echo "${BASH_REMATCH[1]}@${BASH_REMATCH[2]}" >> /tmp/uses_new.txt
+              fi
+            done <<< "$DIFF"
+            for f in /tmp/uses_old.txt /tmp/uses_new.txt; do [[ -f "$f" ]] || touch "$f"; done
+            while read -r new_entry; do
+              name="${new_entry%%@*}"
+              to_ref="${new_entry#*@}"
+              while read -r old_entry; do
+                oname="${old_entry%%@*}"
+                from_ref="${old_entry#*@}"
+                if [[ "$oname" == "$name" && "$from_ref" != "$to_ref" ]]; then
+                  dep_name="$name"
+                  uses_query="uses: ${name}@${to_ref}"
+                  extracted_from_diff=true
+                  old_line="$(echo "$DIFF" | grep -F -- "${name}@${from_ref}" | head -1)"
+                  new_line="$(echo "$DIFF" | grep -F -- "${name}@${to_ref}" | head -1)"
+                  from_version="$(echo "$old_line" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | tail -1 | sed 's/^v//')"
+                  to_version="$(echo "$new_line" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | tail -1 | sed 's/^v//')"
+                  break 2
+                fi
+              done < /tmp/uses_old.txt
+            done < /tmp/uses_new.txt
+            rm -f /tmp/uses_old.txt /tmp/uses_new.txt
+            if [[ -n "$dep_name" ]]; then
+              echo "Detected (diff) GitHub Action: USES_QUERY=$uses_query"
+            elif echo "$DIFF" | grep -qE '^[+-].*uses:'; then
+              echo "Debug: diff has uses: lines but no matching pair. Sample:"
+              echo "$DIFF" | grep -E '^[+-].*uses:' | head -5
+            fi
+          fi
+
+          # ---- go.mod: require path vX.Y.Z ----
+          if [[ -z "$dep_name" && -n "$DIFF" ]] && echo "$DIFF" | grep -q 'go\.mod'; then
+            rm -f /tmp/gomod_removed.txt /tmp/gomod_added.txt
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^-[[:space:]]+([^[:space:]]+)[[:space:]]+v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" >> /tmp/gomod_removed.txt
+              fi
+              if [[ "$line" =~ ^\+[[:space:]]+([^[:space:]]+)[[:space:]]+v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" >> /tmp/gomod_added.txt
+              fi
+            done <<< "$DIFF"
+            for f in /tmp/gomod_removed.txt /tmp/gomod_added.txt; do [[ -f "$f" ]] || touch "$f"; done
+            while read -r added; do
+              path="${added% *}"
+              to_v="${added#* }"
+              while read -r removed; do
+                rpath="${removed% *}"
+                from_v="${removed#* }"
+                if [[ "$rpath" == "$path" && "$from_v" != "$to_v" ]]; then
+                  dep_name="$path"
+                  from_version="$from_v"
+                  to_version="$to_v"
+                  extracted_from_diff=true
+                  break 2
+                fi
+              done < /tmp/gomod_removed.txt
+            done < /tmp/gomod_added.txt
+            rm -f /tmp/gomod_removed.txt /tmp/gomod_added.txt
+            if [[ -n "$dep_name" ]]; then
+              echo "Detected (diff) go.mod: $dep_name $from_version -> $to_version"
+            fi
+          fi
+
+          # ---- Fallback: title/body (no Actions query from fallback) ----
+          if [[ -z "$dep_name" ]]; then
+            dep_name="$(echo "$COMMIT_SUBJECT" | sed -E 's/.*[Bb]ump ([^ ]+) .*/\1/; t; s/.*[Uu]pdate ([^ ]+) .*/\1/')"
+            [[ "$dep_name" == "$COMMIT_SUBJECT" ]] && dep_name=""
+          fi
+          if [[ -n "$dep_name" && "$extracted_from_diff" != "true" ]]; then
+            echo "Dependency Name (title): $dep_name"
+          fi
+          if [[ -z "$from_version" || -z "$to_version" ]]; then
+            text="$COMMIT_SUBJECT"
+            [[ "$text" =~ [0-9]+\.[0-9]+\.[0-9]+ ]] || text="$(echo "$COMMIT_BODY" | grep -iE 'bump|update|version' | head -5)"
+            mapfile -t versions < <(echo "$text" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/^v//' | head -2)
+            if [[ "${#versions[@]}" -ge 2 ]]; then
+              from_version="${versions[0]}"
+              to_version="${versions[1]}"
+              echo "Versions (title/body): $from_version -> $to_version"
+            elif [[ "${#versions[@]}" -eq 1 ]]; then
+              to_version="${versions[0]}"
+            fi
+          fi
+
+          [[ -n "$dep_name" ]] && echo "DEP_NAME=$dep_name" >> "$GITHUB_ENV"
+          [[ -n "$from_version" ]] && echo "FROM_VERSION=$from_version" >> "$GITHUB_ENV"
+          [[ -n "$to_version" ]] && echo "TO_VERSION=$to_version" >> "$GITHUB_ENV"
+          [[ -n "$uses_query" ]] && echo "USES_QUERY=$uses_query" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "========== RESULTS =========="
+          echo "DEP_NAME=$dep_name"
+          echo "FROM_VERSION=$from_version"
+          echo "TO_VERSION=$to_version"
+          echo "USES_QUERY=$uses_query"
+          echo "============================="
+
+      - name: Get Changed Files
+        id: changed_files
+        shell: bash
+        env:
+          DEPENDABOT_SHA: "${{ inputs.commit_sha }}"
+        run: |
+          REF="${DEPENDABOT_SHA:-HEAD}"
+          changed="$(git diff --name-only "$REF^..$REF" 2>/dev/null || git diff --name-only HEAD^..HEAD 2>/dev/null)"
+          if [[ -n "$changed" ]]; then
+            echo "any_changed=true" >> "$GITHUB_OUTPUT"
+            echo "all_changed_files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$changed" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "Changed files:"
+            echo "$changed"
+          else
+            echo "any_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No files changed."
+          fi
+
+      - name: Classify Risk Based on Semantic Version
+        id: classify_risk
+        shell: bash
+        run: |
+          risk="high"
+
+          if [[ -z "${{ env.FROM_VERSION }}" || -z "${{ env.TO_VERSION }}" ]]; then
+            echo "No clear versioning detected."
+            echo "Risk level: $risk"
+            echo "risk_level=$risk" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FROM_VER_MAJOR=$(echo "${{ env.FROM_VERSION }}" | cut -d. -f1)
+          FROM_VER_MINOR=$(echo "${{ env.FROM_VERSION }}" | cut -d. -f2)
+          TO_VER_MAJOR=$(echo "${{ env.TO_VERSION }}" | cut -d. -f1)
+          TO_VER_MINOR=$(echo "${{ env.TO_VERSION }}" | cut -d. -f2)
+
+          if [[ "$FROM_VER_MAJOR" -eq "$TO_VER_MAJOR" && "$FROM_VER_MINOR" -eq "$TO_VER_MINOR" ]]; then
+            echo "Patch update detected."
+            risk="low"
+          elif [[ "$FROM_VER_MAJOR" -eq "$TO_VER_MAJOR" && "$FROM_VER_MINOR" -lt "$TO_VER_MINOR" ]]; then
+            echo "Minor update detected."
+            risk="medium"
+          else
+            echo "Major update detected. Likely includes breaking changes. Requires manual review."
+          fi
+
+          echo "Risk level: $risk"
+          echo "risk_level=$risk" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Ecosystem
+        id: detect_ecosystem
+        if: steps.changed_files.outputs.any_changed == 'true'
+        env:
+          ALL_CHANGED_FILES: "${{ steps.changed_files.outputs.all_changed_files }}"
+        shell: bash
+        run: |
+          eco="unknown"
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            base="$(basename "$file")"
+            case "$base" in
+              go.mod|go.sum)                       eco="go"; break ;;
+              requirements*.txt|pyproject.toml)    eco="python"; break ;;
+              setup.cfg|setup.py|poetry.lock)      eco="python"; break ;;
+              Pipfile|Pipfile.lock|uv.lock)        eco="python"; break ;;
+            esac
+            case "$file" in
+              .github/workflows/*|.github/actions/*) eco="github_actions"; break ;;
+            esac
+          done <<< "$ALL_CHANGED_FILES"
+
+          echo "Detected ecosystem: $eco"
+          echo "ecosystem=$eco" >> "$GITHUB_OUTPUT"
+
+      - name: Search GitHub for Dependency Usage
+        id: check_popularity
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          dep="${{ env.DEP_NAME }}"
+          uses_query="${{ env.USES_QUERY }}"
+          eco="${{ steps.detect_ecosystem.outputs.ecosystem }}"
+
+          case "$eco" in
+            python)
+              echo "Queries for Python dependencies are not consistent enough. Skipping"
+              echo "updates_count=0" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            go)
+              query="${dep} v${{ env.TO_VERSION }} filename:go.mod"
+              ;;
+            github_actions)
+              if [[ -n "${uses_query}" ]]; then
+                query="${uses_query} path:.github/workflows/"
+              else
+                echo "No USES_QUERY for Actions, skipping search."
+                echo "updates_count=0" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            *)
+              echo "Unknown ecosystem, skipping search."
+              echo "updates_count=0" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          echo "Searching GitHub with following query:"
+          echo " - gh search code \"$query\" --json repository --limit 25"
+
+          for i in {1..3}; do
+            result="$(gh search code "$query" --json repository --limit 25 2>/dev/null)" && break
+            echo "Search failed (attempt $i), retrying..."
+            sleep "$((i * 5))"
+          done
+
+          if [[ -z "$result" ]]; then
+            echo "updates_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          repo_list="$(jq -r '.[].repository.nameWithOwner' <<<"$result" | sort -u)"
+          count=$(wc -w <<<"$repo_list")
+
+          echo "Repository Count: $count"
+          echo "Repository List: $repo_list"
+
+          {
+            echo "updates_count=$count"
+            echo "repo_list<<EOF"
+            echo "$repo_list"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "========== TEST SUMMARY =========="
+          echo "Repo:         ${{ inputs.repo }}"
+          echo "Commit:       ${{ inputs.commit_sha }}"
+          echo "DEP_NAME:     ${{ env.DEP_NAME }}"
+          echo "FROM_VERSION: ${{ env.FROM_VERSION }}"
+          echo "TO_VERSION:   ${{ env.TO_VERSION }}"
+          echo "USES_QUERY:   ${{ env.USES_QUERY }}"
+          echo "Risk Level:   ${{ steps.classify_risk.outputs.risk_level }}"
+          echo "Ecosystem:    ${{ steps.detect_ecosystem.outputs.ecosystem }}"
+          echo "Usage Count:  ${{ steps.check_popularity.outputs.updates_count }}"
+          echo "=================================="
