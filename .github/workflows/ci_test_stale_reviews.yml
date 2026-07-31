@@ -1,0 +1,28 @@
+name: "Test: Stale Review Alerts"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stale-days:
+        description: "Business days threshold (use 0 for immediate testing)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+  actions: none
+  id-token: none
+  security-events: none
+  pull-requests: none
+
+jobs:
+  call_reusable_stale_reviews:
+    name: "Test: Stale Review Check"
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/reusable_stale_reviews.yml
+    with:
+      stale-days: ${{ fromJSON(inputs.stale-days) }}
