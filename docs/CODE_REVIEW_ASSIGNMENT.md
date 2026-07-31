@@ -135,7 +135,110 @@ Revisit this configuration when:
 - Review workload feels uneven despite Load Balance -- verify that
   "Count existing requests" is enabled and check for members in many
   teams.
+- Stale review alerts are firing frequently -- see
+  [Stale Review Alerts](#stale-review-alerts) for threshold tuning.
+
+## Stale Review Alerts
+
+Even with Load Balance, a review request can silently stall if the assigned
+reviewer is overloaded or unavailable. The **Stale Review Alerts** workflow
+detects these cases and surfaces them.
+
+### How It Works
+
+A scheduled GitHub Actions workflow runs every weekday at 09:00 UTC. For each
+open PR with pending review requests, it calculates how many **business days**
+have elapsed since the review was requested (using timeline events to
+determine the exact request date). If the threshold is exceeded:
+
+1. A `stale-review` label is applied to the PR.
+2. A comment is posted @-mentioning the assigned reviewer(s) with the
+   number of business days each has been pending.
+
+Draft PRs and PRs with an existing approval are skipped. To avoid spam,
+a reminder is posted at most once every 3 days per PR.
+
+### Implementation
+
+The workflow uses `actions/github-script` (GitHub-maintained) with inline
+logic. No third-party actions are involved. This eliminates supply chain
+risk from dormant or single-maintainer community actions.
+
+The business-day calculation excludes weekends (Saturday/Sunday). Holiday
+awareness is not included — if needed in the future, a holiday calendar
+can be added to the script.
+
+### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `stale-days` | 5 | Business days before flagging |
+| `stale-label` | `stale-review` | Label applied to flagged PRs |
+
+Additional behavior (hardcoded, changeable in the script):
+
+- Draft PRs are skipped.
+- PRs with at least 1 approval are skipped.
+- Reminders are deduplicated (3-day cooldown per PR).
+- The `stale-review` label is auto-removed when no pending reviewers remain.
+
+### Workflow Files
+
+| File | Purpose |
+|------|---------|
+| `.github/workflows/ci_stale_reviews.yml` | Per-repo scheduled caller |
+| `.github/workflows/reusable_stale_reviews.yml` | Reusable workflow (org-infra) |
+
+The caller workflow is synced to repositories via `sync-config.yml`. The
+reusable workflow remains in org-infra and is referenced cross-repo.
+
+### Rollout
+
+The workflow is deployed in stages:
+
+1. **Phase 1** -- org-infra only (current). Validates that the action fires
+   correctly, labels are applied, and comments render properly.
+2. **Phase 2** -- Remove repos from the `exclude_repos` list in
+   `sync-config.yml` once Phase 1 is confirmed.
+
+### Responding to Alerts
+
+When a PR is flagged:
+
+- **Reviewer available:** Complete the review or leave a status comment
+  explaining when review will happen.
+- **Reviewer unavailable:** Re-request review from another team member or
+  use `/assign-reviewer` to trigger Load Balance rebalancing.
+- **PR no longer relevant:** Close the PR or convert to draft.
+
+The `stale-review` label is automatically removed the next time the workflow
+runs if the PR has received a review or approval.
+
+### Customization
+
+To override the threshold for a specific repository, pass inputs to the
+reusable workflow in the caller:
+
+```yaml
+jobs:
+  call_reusable_stale_reviews:
+    uses: ./.github/workflows/reusable_stale_reviews.yml
+    with:
+      stale-days: 3
+```
+
+### Fallback Plan
+
+If `actions/github-script` introduces a breaking change or the inline
+script needs replacement, the logic is self-contained and can be moved to:
+
+1. A standalone script file (`.github/scripts/stale-reviews.mjs`) invoked
+   via `node` in a run step.
+2. A composite action in this repository (no external dependency).
+
+Both options preserve zero third-party supply chain risk.
 
 ## References
 
 - [Managing code review settings for your team](https://docs.github.com/en/organizations/organizing-members-into-teams/managing-code-review-settings-for-your-team) -- GitHub documentation covering auto-assignment configuration, routing algorithms, and team notification settings.
+- [#478](https://github.com/complytime/org-infra/issues/478) -- Stale review request alerts task.

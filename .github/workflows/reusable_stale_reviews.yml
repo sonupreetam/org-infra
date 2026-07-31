@@ -1,0 +1,207 @@
+name: Reusable Stale Review Alerts
+
+# --------------------------------------------------------------------------
+# This workflow only runs when explicitly called by another workflow.
+# It flags pull requests whose review requests have been pending beyond a
+# configurable number of business days, adding a label and posting a comment
+# that @-mentions the assigned reviewer(s).
+#
+# Depends only on actions/github-script (GitHub-maintained). No third-party
+# actions are used. Business-day calculation and staleness detection are
+# implemented inline.
+# --------------------------------------------------------------------------
+on:
+  workflow_call:
+    inputs:
+      stale-days:
+        description: "Business days before a review request is considered stale"
+        required: false
+        type: number
+        default: 5
+      stale-label:
+        description: "Label to apply to stale PRs"
+        required: false
+        type: string
+        default: "stale-review"
+
+permissions:
+  contents: read
+  actions: none
+  id-token: none
+  security-events: none
+  pull-requests: none
+
+jobs:
+  stale_review_check:
+    name: Stale Review Check
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect and flag stale review requests
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const STALE_DAYS = ${{ inputs.stale-days }};
+            const STALE_LABEL = '${{ inputs.stale-label }}';
+            const SIGNATURE = '<!-- stale-review-alert -->';
+
+            function countBusinessDays(from, to) {
+              let count = 0;
+              const current = new Date(from);
+              current.setHours(0, 0, 0, 0);
+              const end = new Date(to);
+              end.setHours(0, 0, 0, 0);
+              while (current < end) {
+                current.setDate(current.getDate() + 1);
+                const day = current.getDay();
+                if (day !== 0 && day !== 6) count++;
+              }
+              return count;
+            }
+
+            const { owner, repo } = context.repo;
+            const now = new Date();
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            for (const pr of prs) {
+              if (pr.draft) continue;
+
+              const { data: requestedReviewers } = await github.rest.pulls.listRequestedReviewers({
+                owner,
+                repo,
+                pull_number: pr.number,
+              });
+
+              const pendingUsers = requestedReviewers.users || [];
+              const pendingTeams = requestedReviewers.teams || [];
+
+              if (pendingUsers.length === 0 && pendingTeams.length === 0) {
+                // No pending reviewers — remove stale label if present
+                const labels = pr.labels.map(l => l.name);
+                if (labels.includes(STALE_LABEL)) {
+                  await github.rest.issues.removeLabel({
+                    owner, repo,
+                    issue_number: pr.number,
+                    name: STALE_LABEL,
+                  }).catch(() => {});
+                }
+                continue;
+              }
+
+              // Check if any existing review/approval exists (skip if so)
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              const hasApproval = reviews.some(r => r.state === 'APPROVED');
+              if (hasApproval) continue;
+
+              // Find when reviewers were requested via timeline events
+              const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner,
+                repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+
+              const reviewRequestEvents = timeline.filter(e => e.event === 'review_requested');
+
+              let oldestStaleRequest = null;
+              const staleReviewers = [];
+
+              for (const user of pendingUsers) {
+                const requestEvent = reviewRequestEvents
+                  .filter(e => e.requested_reviewer && e.requested_reviewer.login === user.login)
+                  .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                const requestedAt = requestEvent
+                  ? new Date(requestEvent.created_at)
+                  : new Date(pr.created_at);
+
+                const bizDays = countBusinessDays(requestedAt, now);
+                if (bizDays >= STALE_DAYS) {
+                  staleReviewers.push({ mention: `@${user.login}`, days: bizDays });
+                  if (!oldestStaleRequest || requestedAt < oldestStaleRequest) {
+                    oldestStaleRequest = requestedAt;
+                  }
+                }
+              }
+
+              for (const team of pendingTeams) {
+                const requestEvent = reviewRequestEvents
+                  .filter(e => e.requested_team && e.requested_team.slug === team.slug)
+                  .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                const requestedAt = requestEvent
+                  ? new Date(requestEvent.created_at)
+                  : new Date(pr.created_at);
+
+                const bizDays = countBusinessDays(requestedAt, now);
+                if (bizDays >= STALE_DAYS) {
+                  staleReviewers.push({ mention: `@${owner}/${team.slug}`, days: bizDays });
+                  if (!oldestStaleRequest || requestedAt < oldestStaleRequest) {
+                    oldestStaleRequest = requestedAt;
+                  }
+                }
+              }
+
+              if (staleReviewers.length === 0) continue;
+
+              // Check for recent reminder to avoid spamming
+              const { data: comments } = await github.rest.issues.listComments({
+                owner, repo,
+                issue_number: pr.number,
+                per_page: 50,
+              });
+
+              const recentReminder = comments.find(c =>
+                c.body.includes(SIGNATURE) &&
+                (now - new Date(c.created_at)) < 3 * 24 * 60 * 60 * 1000
+              );
+              if (recentReminder) continue;
+
+              // Apply label
+              const labels = pr.labels.map(l => l.name);
+              if (!labels.includes(STALE_LABEL)) {
+                await github.rest.issues.addLabels({
+                  owner, repo,
+                  issue_number: pr.number,
+                  labels: [STALE_LABEL],
+                });
+              }
+
+              // Post reminder comment
+              const reviewerList = staleReviewers
+                .map(r => `- ${r.mention} (${r.days} business days)`)
+                .join('\n');
+
+              const body = [
+                SIGNATURE,
+                `### Stale Review Alert`,
+                '',
+                `This PR has review requests pending for **${STALE_DAYS}+ business days**:`,
+                '',
+                reviewerList,
+                '',
+                'If you are unable to review, please re-assign or let the team know.',
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner, repo,
+                issue_number: pr.number,
+                body,
+              });
+
+              core.info(`PR #${pr.number}: flagged ${staleReviewers.length} stale reviewer(s)`);
+            }

@@ -1,0 +1,20 @@
+name: Stale Review Alerts
+
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'  # Weekdays at 09:00 UTC
+
+permissions:
+  contents: read
+  actions: none
+  id-token: none
+  security-events: none
+  pull-requests: none
+
+jobs:
+  call_reusable_stale_reviews:
+    name: Stale Review Check
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/reusable_stale_reviews.yml

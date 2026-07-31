@@ -58,6 +58,24 @@ files_to_sync:
       - complytime-policies
       - community
 
+  - source: .github/workflows/ci_stale_reviews.yml
+    destination: .github/workflows/ci_stale_reviews.yml
+    exclude_repos:
+      - .github
+      - community
+      # Staged rollout: validate on org-infra first, then widen once
+      # confirmed working (#478).
+      - complyapi
+      - complyctl
+      - complypack
+      - complytime
+      - complytime-collector-components
+      - complytime-demos
+      - complytime-policies
+      - complytime-providers
+      - homebrew-tap
+      - website
+
   # Configuration Files
   - source: .mega-linter.yml
     destination: .mega-linter.yml
