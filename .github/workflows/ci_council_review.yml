@@ -40,7 +40,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    uses: complytime/org-infra/.github/workflows/reusable_council_review.yml@main  # zizmor: ignore[unpinned-uses] — internal org workflow, @main is intentional
+    uses: sonupreetam/org-infra/.github/workflows/reusable_council_review.yml@main  # TEMPORARY: evidence test for #429, revert before merge
     permissions:
       contents: read
       id-token: write

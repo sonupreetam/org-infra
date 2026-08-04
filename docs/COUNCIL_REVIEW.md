@@ -1,5 +1,7 @@
 # Council Review — Operational Guide
 
+<!-- Evidence test for #429 security hardening — verifies issue_comment trigger chain -->
+
 AI-assisted PR review using OpenCode on Vertex AI with Divisor persona
 discovery. Reviews are posted as inline comments on PR diff lines.
 Invoked by posting `/council-review` as a PR comment. Only org members
