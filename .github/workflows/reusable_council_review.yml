@@ -9,6 +9,11 @@ name: Reusable Council Review
 # inline review comments on the PR.
 #
 # Called by ci_council_review.yml (consumer workflow).
+#
+# Security hardening (#429):
+# - Network egress blocked via step-security/harden-runner; only Vertex AI,
+#   GitHub API, npm registry, and GCP auth endpoints are allowed.
+# - 5-minute cooldown between reviews per PR to prevent token exhaustion.
 # --------------------------------------------------------------------------
 on:
   workflow_call:
@@ -42,6 +47,29 @@ jobs:
     env:
       VERTEX_LOCATION: global
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          # Vertex AI may route to regional endpoints for Anthropic models
+          # even when using the global endpoint. Add new regions here if
+          # the model routing changes.
+          allowed-endpoints: >
+            agent.api.stepsecurity.io:443
+            api.github.com:443
+            github.com:443
+            uploads.github.com:443
+            objects.githubusercontent.com:443
+            global-aiplatform.googleapis.com:443
+            us-central1-aiplatform.googleapis.com:443
+            us-east1-aiplatform.googleapis.com:443
+            oauth2.googleapis.com:443
+            iamcredentials.googleapis.com:443
+            sts.googleapis.com:443
+            storage.googleapis.com:443
+            registry.npmjs.org:443
+            nodejs.org:443
+
       - name: Check WIF credentials
         id: gate
         env:
@@ -79,20 +107,73 @@ jobs:
             echo "pr_head_sha=${PR_HEAD_SHA}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate to Google Cloud (WIF)
+      - name: Check cooldown (5-minute minimum between reviews)
         if: steps.gate.outputs.should_review == 'true'
+        id: cooldown
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          COOLDOWN_SECONDS: "300"
+        run: |
+          # Find the most recent actual review comment timestamp.
+          # Filter for "## AI Council Review" to exclude cooldown notices
+          # and non-member notices (which also contain the bot sentinel).
+          LAST_REVIEW=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq '[.[] | select(.body | contains("<!-- council-review-bot -->") and (.body | contains("## AI Council Review"))) | .created_at] | sort | last // empty')
+
+          if [[ -z "${LAST_REVIEW}" ]]; then
+            echo "::notice::No previous council review found — proceeding"
+            echo "cooled_down=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_EPOCH=$(date -d "${LAST_REVIEW}" +%s 2>/dev/null || echo "0")
+          if [[ "${LAST_EPOCH}" == "0" ]]; then
+            echo "::warning::Could not parse last review timestamp '${LAST_REVIEW}' — skipping cooldown"
+            echo "cooled_down=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NOW_EPOCH=$(date +%s)
+          ELAPSED=$((NOW_EPOCH - LAST_EPOCH))
+
+          if [[ "${ELAPSED}" -lt "${COOLDOWN_SECONDS}" ]]; then
+            REMAINING=$((COOLDOWN_SECONDS - ELAPSED))
+            echo "::notice::Council review cooldown active — last review ${ELAPSED}s ago, ${REMAINING}s remaining. Skipping."
+            # Post a notice comment so the user knows why the review was skipped
+            {
+              echo "<!-- council-review-bot -->"
+              echo "> Council review cooldown active — last review was ${ELAPSED}s ago."
+              echo "> Please wait ${REMAINING}s before requesting another review."
+            } > /tmp/council-review-cooldown.md
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file /tmp/council-review-cooldown.md
+            echo "cooled_down=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Cooldown elapsed (${ELAPSED}s since last review) — proceeding"
+            echo "cooled_down=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to Google Cloud (WIF)
+        if: >-
+          steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
       - name: Set up gcloud CLI
-        if: steps.gate.outputs.should_review == 'true'
+        if: >-
+          steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true'
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # TODO(#440): remove continue-on-error once council review is stable
       - name: Run council review
-        if: steps.gate.outputs.should_review == 'true'
+        if: >-
+          steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true'
         id: review
         continue-on-error: true
         uses: unbound-force/unbound-force/council-review-action@7836c070a63f3eeeab78ebd48c5dd5921ae486e2  # main (merged #336)
@@ -105,6 +186,7 @@ jobs:
       - name: Clean up previous bot comments
         if: >-
           steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true' &&
           steps.review.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -135,6 +217,7 @@ jobs:
       - name: Post review summary
         if: >-
           steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true' &&
           steps.review.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -172,6 +255,7 @@ jobs:
       - name: Post inline comments
         if: >-
           steps.gate.outputs.should_review == 'true' &&
+          steps.cooldown.outputs.cooled_down == 'true' &&
           steps.review.outcome == 'success' &&
           steps.review.outputs.review-mode == 'inline'
         env:

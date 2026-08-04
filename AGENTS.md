@@ -30,24 +30,29 @@ make clean           # Remove __pycache__ and .pyc
 
 ## Council Review (AI-assisted PR review)
 
-Three-workflow chain for automated AI code review using OpenCode on Vertex AI,
-with Divisor persona discovery from the reviewed repo.
+Comment-triggered workflow chain for AI code review using OpenCode on Vertex AI,
+with Divisor persona discovery from the reviewed repo. Invoked by posting
+`/council-review` as a PR comment. Only org members can invoke.
 
 ### Workflow chain
 
 ```text
-ci_council_review_collect.yml  (pull_request)  [synced to downstream repos]
-  ├── Gate: skip drafts, dependabot, non-org-members
+ci_council_review_collect.yml  (issue_comment: /council-review)  [synced]
+  ├── Gate: only PR comments starting with /council-review
+  ├── Gate: skip drafts, dependabot PRs
+  ├── Gate: verify commenter is an org member (notice reply if not)
   ├── Collect diff: gh pr diff → pr-diff.patch
   ├── Build metadata: pr-meta.json
   └── Upload artifact (1-day retention)
          │
          ▼  workflow_run / workflow_dispatch
-ci_council_review.yml  (consumer)  [synced to downstream repos]
+ci_council_review.yml  (consumer)  [synced]
   └── Calls reusable_council_review.yml@main (org-infra only)
          │
          ▼  workflow_call
 reusable_council_review.yml  [NOT synced — org-infra only]
+  ├── Harden runner (egress blocked, allowlist only)
+  ├── Cooldown check (5-minute minimum between reviews)
   ├── WIF auth → Vertex AI
   ├── council-review-action (composite, SHA-pinned, from unbound-force)
   ├── Clean up previous bot comments

@@ -7,35 +7,56 @@
 name: Council Review - Collect
 
 # --------------------------------------------------------------------------
-# Fork-safe PR diff collection for AI council review. Runs on pull_request,
-# collects the PR diff and metadata, then uploads as an artifact for
+# Comment-triggered PR diff collection for AI council review.
+# Runs when an org member posts `/council-review` on a PR.
+# Collects the PR diff and metadata, then uploads as an artifact for
 # ci_council_review.yml to pick up via workflow_run.
+#
+# Security: only org members can invoke (verified via GitHub API).
+# Non-member comments are ignored with a notice reply.
 #
 # Org membership check uses ORG_CHECK_TOKEN (PAT with org:read scope) if
 # available, falling back to GITHUB_TOKEN (public membership only).
 # --------------------------------------------------------------------------
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
+  issue_comment:
+    types: [created]
 
 permissions: {}
 
 jobs:
   gate-check:
     name: Gate Check
+    # Only run on PR comments (not issue comments) that start with /council-review
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/council-review')
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: write
     outputs:
       should_collect: ${{ steps.org-check.outputs.should_collect != '' && steps.org-check.outputs.should_collect || steps.gate.outputs.should_collect }}
+      pr_number: ${{ github.event.issue.number }}
     steps:
       - name: Evaluate gate conditions
         id: gate
         env:
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
         run: |
+          # Fetch PR details to check state and draft status
+          PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          PR_STATE=$(echo "${PR_JSON}" | jq -r '.state')
+          PR_DRAFT=$(echo "${PR_JSON}" | jq -r '.draft')
+          PR_AUTHOR=$(echo "${PR_JSON}" | jq -r '.user.login')
+
+          if [[ "${PR_STATE}" != "open" ]]; then
+            echo "::notice::PR is ${PR_STATE} — skipping council review"
+            echo "should_collect=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ "${PR_DRAFT}" == "true" ]]; then
             echo "::notice::Draft PR — skipping council review"
             echo "should_collect=false" >> "$GITHUB_OUTPUT"
@@ -48,23 +69,40 @@ jobs:
           fi
           echo "should_collect=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify org membership
+      - name: Verify org membership of commenter
         if: steps.gate.outputs.should_collect == 'true'
         id: org-check
         env:
           GH_TOKEN: ${{ secrets.ORG_CHECK_TOKEN != '' && secrets.ORG_CHECK_TOKEN || github.token }}
-          ACTOR: ${{ github.event.pull_request.user.login }}
+          COMMENTER: ${{ github.event.comment.user.login }}
           ORG: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          POST_TOKEN: ${{ github.token }}
         run: |
           HTTP_STATUS=$(curl -s -L -o /dev/null -w "%{http_code}" \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/orgs/$ORG/members/$ACTOR")
+            "https://api.github.com/orgs/$ORG/members/$COMMENTER")
+          if [[ "$HTTP_STATUS" == "401" || "$HTTP_STATUS" == "403" ]]; then
+            echo "::warning::Org membership check failed with HTTP ${HTTP_STATUS} — ORG_CHECK_TOKEN may be expired or misconfigured"
+            echo "should_collect=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ "$HTTP_STATUS" != "204" ]]; then
-            echo "::notice::PR author ${ACTOR} is not a member of ${ORG} (HTTP ${HTTP_STATUS}) — skipping council review"
+            echo "::notice::Commenter ${COMMENTER} is not a member of ${ORG} (HTTP ${HTTP_STATUS}) — ignoring /council-review"
+            # Post a notice reply so the commenter knows why it was ignored
+            {
+              echo "<!-- council-review-bot -->"
+              echo "> \`/council-review\` is available to org members."
+              echo "> If you'd like a council review on this PR, ask an org member to run the command."
+            } > /tmp/council-review-notice.md
+            GH_TOKEN="${POST_TOKEN}" gh pr comment "${PR_NUMBER}" \
+              --repo "${REPO}" \
+              --body-file /tmp/council-review-notice.md
             echo "should_collect=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::✓ ${ACTOR} is a member of ${ORG}"
+            echo "::notice::${COMMENTER} is a member of ${ORG}"
             echo "should_collect=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -77,20 +115,39 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Fetch PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.gate-check.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          {
+            echo "head_sha=$(echo "${PR_JSON}" | jq -r '.head.sha')"
+            echo "base_ref=$(echo "${PR_JSON}" | jq -r '.base.ref')"
+          } >> "$GITHUB_OUTPUT"
+          # Use heredoc delimiter for title to handle newlines safely
+          {
+            echo "title<<TITLE_EOF"
+            echo "${PR_JSON}" | jq -r '.title'
+            echo "TITLE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Collect PR diff
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ needs.gate-check.outputs.pr_number }}
         run: |
           gh pr diff "${PR_NUMBER}" \
             --repo "${{ github.repository }}" > pr-diff.patch
 
       - name: Write PR metadata
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ needs.gate-check.outputs.pr_number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
         run: |
           jq -n \
             --arg number "${PR_NUMBER}" \

@@ -2,6 +2,8 @@
 
 AI-assisted PR review using OpenCode on Vertex AI with Divisor persona
 discovery. Reviews are posted as inline comments on PR diff lines.
+Invoked by posting `/council-review` as a PR comment. Only org members
+can invoke.
 
 ## Architecture
 
@@ -9,8 +11,10 @@ discovery. Reviews are posted as inline comments on PR diff lines.
 ┌─────────────────────────────────────────────────────────┐
 │  Downstream Repo (e.g., complytime, gaze)               │
 │                                                         │
-│  ci_council_review_collect.yml  (pull_request trigger)  │
-│  ├── Gate: skip bots, drafts, non-org-members           │
+│  ci_council_review_collect.yml  (issue_comment trigger) │
+│  ├── Gate: only PR comments starting with /council-review│
+│  ├── Gate: skip drafts, dependabot PRs                  │
+│  ├── Gate: verify commenter is org member (notice if not)│
 │  ├── Capture diff: gh pr diff → pr-diff.patch           │
 │  ├── Build metadata: pr-meta.json                       │
 │  └── Upload artifact: council-review-diff               │
@@ -22,6 +26,8 @@ discovery. Reviews are posted as inline comments on PR diff lines.
 ┌────────────────────────▼────────────────────────────────┐
 │  org-infra: reusable_council_review.yml                 │
 │                                                         │
+│  ├── Harden runner (egress blocked, allowlist only)     │
+│  ├── Cooldown check (5-minute minimum between reviews)  │
 │  ├── Download artifact (pr-diff.patch, pr-meta.json)    │
 │  ├── WIF auth → Google Cloud (Vertex AI)                │
 │  ├── council-review-action (SHA-pinned composite)       │
@@ -41,9 +47,9 @@ discovery. Reviews are posted as inline comments on PR diff lines.
 
 | File | Synced? | Trigger | Purpose |
 |------|---------|---------|---------|
-| `ci_council_review_collect.yml` | Yes | `pull_request` | Fork-safe diff collection, no secrets needed |
+| `ci_council_review_collect.yml` | Yes | `issue_comment` | Comment-triggered diff collection (`/council-review`) |
 | `ci_council_review.yml` | Yes | `workflow_run` / `workflow_dispatch` | Thin consumer, passes secrets to the reusable |
-| `reusable_council_review.yml` | **No** | `workflow_call` | Core logic: WIF auth, action invocation, comment posting |
+| `reusable_council_review.yml` | **No** | `workflow_call` | Core logic: egress blocking, cooldown, WIF auth, action invocation, comment posting |
 
 Consumer workflows have `DO NOT EDIT` provenance headers indicating they
 are managed by org-infra. Downstream repos should not modify them directly.
@@ -63,13 +69,20 @@ If `ORG_CHECK_TOKEN` is not set, the collect workflow falls back to
 `GITHUB_TOKEN` which can only check **public** org membership. Private org
 members (the GitHub default) will be treated as non-members and skipped.
 
+## Invocation
+
+Post `/council-review` as a comment on a PR to trigger a review.
+
 ## Gate conditions
 
 The collect workflow skips council review when:
 
+- The comment does not start with `/council-review`
+- The comment is on an issue (not a PR)
 - PR is a draft
 - PR author is `dependabot[bot]`
-- PR author is not a member of the repository's org
+- The **commenter** is not a member of the repository's org (a notice
+  reply is posted so the commenter knows why it was ignored)
 
 ## Composite action
 
@@ -92,21 +105,27 @@ The action:
 
 Rollout is staged via `sync-config.yml` `exclude_repos`:
 
-1. **Current**: Only org-infra receives the consumer workflows
+1. **Current**: Only org-infra receives the consumer workflows. Reviews
+   are comment-triggered (`/council-review`) only — no automatic runs.
 2. **Phase 2**: Remove repos from `exclude_repos` after:
    - Composite action SHA points to a merged `main` commit
    - Security hardening (#429) is in place
    - Token consumption controls (#430) are in place
    - End-to-end chain validated on org-infra
+3. **Future graduation**: Once battle-tested, consider re-adding an
+   automatic `pull_request` trigger alongside the comment command (#429).
 
 ## Manual trigger
 
-To manually trigger a council review on an existing PR:
+The standard way to trigger a review is to post `/council-review` as a PR
+comment. The collect workflow runs automatically and the consumer workflow
+picks up the artifact via `workflow_run`.
 
-1. Find the collect workflow run ID from the PR's "Checks" tab
-   (the "Council Review - Collect" run)
+To manually trigger via `workflow_dispatch` (e.g., for debugging):
+
+1. Find the collect workflow run ID from Actions → "Council Review - Collect"
 2. Go to Actions → "Council Review" → "Run workflow"
-3. Select the PR's branch, enter the collect run ID
+3. Enter the collect run ID
 
 Or via CLI:
 
@@ -116,6 +135,34 @@ gh workflow run ci_council_review.yml \
   --ref <branch> \
   -f triggering_run_id=<collect-run-id>
 ```
+
+## Security controls
+
+### Network egress blocking
+
+The reusable workflow uses `step-security/harden-runner` with
+`egress-policy: block`. Only the following endpoints are allowed:
+
+- GitHub API and CDN (`api.github.com`, `github.com`, etc.)
+- Vertex AI (`global-aiplatform.googleapis.com`, regional endpoints)
+- GCP auth (`oauth2.googleapis.com`, `iamcredentials.googleapis.com`, etc.)
+- npm registry (`registry.npmjs.org`, `nodejs.org`)
+- StepSecurity agent (`agent.api.stepsecurity.io`)
+
+To add a new endpoint, update the `allowed-endpoints` list in
+`reusable_council_review.yml`.
+
+### Cooldown
+
+A 5-minute (300s) cooldown is enforced between reviews per PR. The
+cooldown checks the timestamp of the most recent `<!-- council-review-bot -->`
+comment on the PR. If the cooldown is active, the review is skipped and a
+notice comment is posted on the PR.
+
+### CODEOWNERS
+
+Council review workflow files require review from `@complytime/complytime-dev`
+via CODEOWNERS. This ensures human review of security-sensitive changes.
 
 ## Bot comment lifecycle
 
@@ -134,11 +181,18 @@ On each new review:
 The `GCP_WORKLOAD_IDENTITY_PROVIDER` secret is not configured for this repo.
 Set it at the org level or add a repo-level secret.
 
-### Review skipped — "PR author is not a member"
+### Review skipped — "commenter is not a member"
 
-Either the author is not an org member, or `ORG_CHECK_TOKEN` is not set and
-the author's membership is private. Configure `ORG_CHECK_TOKEN` with a PAT
-that has `org:read` scope.
+Either the commenter is not an org member, or `ORG_CHECK_TOKEN` is not set
+and the commenter's membership is private. A notice reply is posted on the
+PR. Configure `ORG_CHECK_TOKEN` with a PAT that has `org:read` scope to
+support private membership checks.
+
+### Review skipped — "cooldown active"
+
+A council review was posted on this PR within the last 5 minutes. Wait for
+the cooldown to elapse and invoke `/council-review` again. The cooldown
+prevents token exhaustion from rapid re-invocations.
 
 ### Review produced no inline comments
 

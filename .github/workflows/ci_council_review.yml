@@ -8,8 +8,12 @@ name: Council Review
 
 # --------------------------------------------------------------------------
 # Thin consumer workflow for AI council review. Triggered by workflow_run
-# when the collect workflow completes (fork PR support), or manually via
-# workflow_dispatch. Delegates all review logic to reusable_council_review.yml.
+# when the collect workflow completes (comment-triggered via /council-review),
+# or manually via workflow_dispatch. Delegates all review logic to
+# reusable_council_review.yml.
+#
+# Rate limiting: per-PR concurrency group prevents parallel reviews on the
+# same PR. The reusable workflow enforces a 5-minute cooldown between reviews.
 # --------------------------------------------------------------------------
 on:
   workflow_dispatch:

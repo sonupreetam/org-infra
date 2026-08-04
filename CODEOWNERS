@@ -2,3 +2,11 @@
 # Unless a later match takes precedence, the team will be requested for review
 # when someone opens a pull request.
 *       @complytime/complytime-dev
+
+# Council review workflow files — explicit entries ensure these files always
+# require complytime-dev review even if the default owner changes in the future.
+# These files control AI review infrastructure, token consumption, and security
+# gates. Refs: #429 (security hardening)
+.github/workflows/ci_council_review.yml           @complytime/complytime-dev
+.github/workflows/ci_council_review_collect.yml    @complytime/complytime-dev
+.github/workflows/reusable_council_review.yml      @complytime/complytime-dev
