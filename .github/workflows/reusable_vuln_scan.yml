@@ -67,6 +67,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve trivyignore path
+        id: ignorefile
+        if: ${{ inputs.trivy_ignorefile != '' }}
+        env:
+          TRIVY_IGNOREFILE: ${{ inputs.trivy_ignorefile }}
+        run: |
+          if [ -f "$TRIVY_IGNOREFILE" ]; then
+            echo "path=$TRIVY_IGNOREFILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::trivyignore file '$TRIVY_IGNOREFILE' not found -- proceeding without it"
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Trivy source scanner
         id: trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -75,7 +88,7 @@ jobs:
           scan-type: "fs"
           scanners: "secret,misconfig"
           severity: ${{ inputs.trivy_severity }}
-          trivyignores: ${{ inputs.trivy_ignorefile }}
+          trivyignores: ${{ steps.ignorefile.outputs.path || '' }}
           ignore-unfixed: true
           format: "sarif"
           output: "trivy-source-scan-${{ github.workflow_sha }}-${{ github.run_number }}.sarif"
