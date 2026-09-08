@@ -49,8 +49,6 @@ files_to_sync:
           complytime-collector-components: "true"
       trivy_ignorefile:
         default: "''"
-        repos:
-          complytime-providers: "'.trivyignore.yaml'"
 
   - source: .github/workflows/ci_council_review_collect.yml
     destination: .github/workflows/ci_council_review_collect.yml
